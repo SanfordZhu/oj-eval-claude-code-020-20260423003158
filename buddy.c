@@ -6,178 +6,91 @@
 #define NULL ((void *)0)
 
 #define MAX_RANK 16
-#define PAGE_SIZE (4 * 1024)  // 4KB
+#define PAGE_SIZE (4 * 1024)
 
-// Data structures for buddy system
+// Simple bitmap-based buddy system
 static void *memory_base = NULL;
 static int total_pages = 0;
-static int max_rank = 0;  // Maximum rank that can fit in available memory
+static int max_rank = 0;
 
-// Tree representation for buddy system
-// For a complete binary tree with n leaves, we need 2n-1 nodes
-// We'll use an array where node i has children at 2i+1 and 2i+2
-static int *tree = NULL;  // Stores the maximum available rank in subtree
-static int tree_size = 0;
+// Free lists: array of linked lists for each rank
+typedef struct Block {
+    struct Block *next;
+    int index;  // Block index at this rank
+} Block;
 
-// Helper functions
-static int get_tree_index(int rank, int offset) {
-    // Convert (rank, offset) to tree index
-    // rank: 1..max_rank (1 = leaf level)
-    // offset: 0..(2^(max_rank-rank)-1)
-    int level = max_rank - rank;  // 0 = leaf level
-    int nodes_at_level = 1 << level;
-    int start_index = (1 << level) - 1;
-    return start_index + offset;
-}
+static Block *free_lists[MAX_RANK + 1];  // Index 1..MAX_RANK
 
-static void update_parents(int index) {
-    // Update parent nodes after a change at index
-    while (index > 0) {
-        int parent = (index - 1) / 2;
-        int left_child = parent * 2 + 1;
-        int right_child = parent * 2 + 2;
+// Allocation bitmap: 1 bit per page (allocated or free)
+static unsigned char *alloc_bitmap = NULL;
+static int bitmap_size = 0;
 
-        int left_val = (left_child < tree_size) ? tree[left_child] : 0;
-        int right_val = (right_child < tree_size) ? tree[right_child] : 0;
-
-        // If both children are free and same rank, parent can be that rank + 1
-        // Otherwise, parent is 0 (split or partially allocated)
-        if (left_val == right_val && left_val > 0) {
-            tree[parent] = left_val + 1;
-        } else {
-            tree[parent] = 0;
-        }
-        index = parent;
-    }
-}
-
-static int find_free_block(int rank, int *offset) {
-    // Find a free block of given rank
-    // Returns 1 if found, 0 otherwise
-    // Sets offset if found
-    if (rank < 1 || rank > max_rank) {
-        return 0;
-    }
-
-    // If root is 0 (split), we need to search children
-    // If root is > 0 but < rank, no block big enough
-    if (tree[0] != 0 && tree[0] < rank) {
-        return 0;
-    }
-
-    // Start from root and go down to find a block
-    int index = 0;
-    int current_rank = max_rank;
-
-    // Find a block of at least the requested rank
-    while (current_rank > rank) {
-        int left_child = index * 2 + 1;
-        int right_child = index * 2 + 2;
-
-        if (left_child < tree_size && tree[left_child] >= rank) {
-            index = left_child;
-        } else if (right_child < tree_size && tree[right_child] >= rank) {
-            index = right_child;
-        } else {
-            return 0;  // Should not happen if tree[0] >= rank
-        }
-        current_rank--;
-    }
-
-    // Now we have a block of exactly current_rank
-    // If it's larger than needed, split it
-    while (current_rank > rank) {
-        // Split the block
-        tree[index] = 0;  // Mark as split
-
-        int left_child = index * 2 + 1;
-        int right_child = index * 2 + 2;
-
-        // Mark both children as free with rank current_rank - 1
-        tree[left_child] = current_rank - 1;
-        tree[right_child] = current_rank - 1;
-
-        // Go to left child (we'll allocate from left)
-        index = left_child;
-        current_rank--;
-    }
-
-    // Mark block as allocated
-    tree[index] = 0;
-    update_parents(index);
-
-    // Calculate offset from leaf position
-    int leaf_index = index - ((1 << (max_rank - rank)) - 1);
-    *offset = leaf_index;
-
-    return 1;
-}
-
-static void mark_block_free(int rank, int offset) {
-    // Mark a block as free and merge with buddy if possible
-    int index = get_tree_index(rank, offset);
-    tree[index] = rank;
-
-    // Try to merge with buddy
-    while (index > 0) {
-        int parent = (index - 1) / 2;
-        int buddy_index;
-
-        // Check if index is left or right child
-        if (index == parent * 2 + 1) {
-            // Left child
-            buddy_index = parent * 2 + 2;
-        } else {
-            // Right child
-            buddy_index = parent * 2 + 1;
-        }
-
-        // Check if buddy is free and same rank
-        if (buddy_index < tree_size && tree[buddy_index] == rank) {
-            // Merge
-            tree[parent] = rank + 1;
-            tree[index] = 0;
-            tree[buddy_index] = 0;
-            index = parent;
-            rank = rank + 1;  // Now we're at higher rank
-        } else {
-            break;
-        }
-    }
-
-    update_parents(index);
-}
-
-static int get_block_rank(void *p) {
-    // Get the rank of block starting at p
-    // Returns 0 if p is not aligned or out of range
+// Helper: get block index from address
+static int addr_to_block_index(void *p, int rank) {
     char *char_p = (char *)p;
     char *char_base = (char *)memory_base;
-    char *char_end = char_base + total_pages * PAGE_SIZE;
-
-    if (char_p < char_base || char_p >= char_end) {
-        return 0;
-    }
-
     ptrdiff_t offset = char_p - char_base;
-    if (offset % PAGE_SIZE != 0) {
-        return 0;
-    }
 
-    // Check all possible ranks from 1 to max_rank
-    for (int rank = 1; rank <= max_rank; rank++) {
-        int block_size = PAGE_SIZE * (1 << (rank - 1));
-        if (offset % block_size == 0) {
-            // Check if this is a valid block boundary
-            int block_index = offset / block_size;
-            int max_blocks = total_pages / (1 << (rank - 1));
-            if (block_index < max_blocks) {
-                return rank;
+    int block_size = PAGE_SIZE * (1 << (rank - 1));
+    return offset / block_size;
+}
+
+// Helper: get address from block index
+static void *block_index_to_addr(int index, int rank) {
+    int block_size = PAGE_SIZE * (1 << (rank - 1));
+    return (char *)memory_base + index * block_size;
+}
+
+// Helper: mark pages in bitmap
+static void mark_pages(int start_page, int num_pages, int allocated) {
+    for (int i = 0; i < num_pages; i++) {
+        int page_idx = start_page + i;
+        if (page_idx < bitmap_size) {
+            if (allocated) {
+                alloc_bitmap[page_idx] = 1;
+            } else {
+                alloc_bitmap[page_idx] = 0;
             }
         }
     }
+}
 
+// Helper: check if pages are allocated
+static int check_pages_allocated(int start_page, int num_pages) {
+    for (int i = 0; i < num_pages; i++) {
+        int page_idx = start_page + i;
+        if (page_idx < bitmap_size && alloc_bitmap[page_idx]) {
+            return 1;
+        }
+    }
     return 0;
+}
+
+// Helper: find buddy index
+static int get_buddy_index(int index, int rank) {
+    return index ^ 1;  // XOR with 1 toggles last bit
+}
+
+// Helper: add block to free list
+static void add_free_block(int rank, int index) {
+    Block *block = (Block *)malloc(sizeof(Block));
+    if (!block) return;
+
+    block->index = index;
+    block->next = free_lists[rank];
+    free_lists[rank] = block;
+}
+
+// Helper: remove block from free list
+static int remove_free_block(int rank, int *index) {
+    if (!free_lists[rank]) return 0;
+
+    Block *block = free_lists[rank];
+    *index = block->index;
+    free_lists[rank] = block->next;
+    free(block);
+
+    return 1;
 }
 
 int init_page(void *p, int pgcount) {
@@ -188,38 +101,41 @@ int init_page(void *p, int pgcount) {
     memory_base = p;
     total_pages = pgcount;
 
-    // Calculate maximum rank that fits in available memory
+    // Calculate maximum rank
     max_rank = 1;
     while ((1 << (max_rank - 1)) <= pgcount && max_rank <= MAX_RANK) {
         max_rank++;
     }
-    max_rank--;  // Last valid rank
+    max_rank--;
 
-    // Allocate tree (2n-1 nodes where n = 2^(max_rank-1))
-    int leaves = 1 << (max_rank - 1);
-    tree_size = 2 * leaves - 1;
-    tree = (int *)malloc(tree_size * sizeof(int));
-    if (!tree) {
-        return -ENOSPC;  // Couldn't allocate metadata
+    // Initialize free lists
+    for (int i = 0; i <= MAX_RANK; i++) {
+        free_lists[i] = NULL;
     }
 
-    // Initialize tree: all blocks free at max_rank
-    for (int i = 0; i < tree_size; i++) {
-        tree[i] = max_rank;
+    // Allocate bitmap
+    bitmap_size = pgcount;
+    alloc_bitmap = (unsigned char *)calloc(pgcount, sizeof(unsigned char));
+    if (!alloc_bitmap) {
+        return -ENOSPC;
     }
 
-    // Adjust for actual page count if not power of 2
-    // Mark unavailable pages as allocated (rank 0)
-    if (pgcount < leaves * (1 << (max_rank - 1))) {
-        // This is complex - we need to mark excess leaves as unavailable
-        // For now, we'll handle it by checking bounds during allocation
-    }
+    // Add initial free block(s)
+    // Add largest possible blocks
+    int remaining = pgcount;
+    int current_rank = max_rank;
 
-    // Adjust for actual page count (might not be power of 2)
-    int max_possible_pages = leaves * (1 << (max_rank - 1));
-    if (pgcount < max_possible_pages) {
-        // Mark excess pages as unavailable
-        // This is complex - for now, we'll handle it in allocation
+    while (remaining > 0 && current_rank >= 1) {
+        int block_pages = 1 << (current_rank - 1);
+        if (block_pages <= remaining) {
+            int num_blocks = remaining / block_pages;
+            for (int i = 0; i < num_blocks; i++) {
+                int block_index = (remaining - block_pages * (i + 1)) / block_pages;
+                add_free_block(current_rank, block_index);
+            }
+            remaining %= block_pages;
+        }
+        current_rank--;
     }
 
     return OK;
@@ -227,23 +143,59 @@ int init_page(void *p, int pgcount) {
 
 void *alloc_pages(int rank) {
     if (rank < 1 || rank > MAX_RANK) {
-        return ERR_PTR(-EINVAL);
+        return -EINVAL;
     }
 
     if (!memory_base || rank > max_rank) {
         return ERR_PTR(-ENOSPC);
     }
 
-    int offset;
-    if (!find_free_block(rank, &offset)) {
-        return ERR_PTR(-ENOSPC);
+    // Try to find free block of this rank
+    int index;
+    if (remove_free_block(rank, &index)) {
+        // Mark pages as allocated
+        int start_page = index * (1 << (rank - 1));
+        int num_pages = 1 << (rank - 1);
+        mark_pages(start_page, num_pages, 1);
+
+        return block_index_to_addr(index, rank);
     }
 
-    // Calculate address
-    size_t block_size = PAGE_SIZE * (1 << (rank - 1));
-    void *addr = (char *)memory_base + offset * block_size;
+    // Try to split larger blocks
+    for (int r = rank + 1; r <= max_rank; r++) {
+        if (free_lists[r]) {
+            // Remove a block of rank r
+            int large_index;
+            if (remove_free_block(r, &large_index)) {
+                // Split it repeatedly until we get rank
+                int current_rank = r;
+                int current_index = large_index;
 
-    return addr;
+                while (current_rank > rank) {
+                    // Split into two blocks of rank current_rank-1
+                    int left_index = current_index * 2;
+                    int right_index = left_index + 1;
+
+                    // Add right block to free list
+                    add_free_block(current_rank - 1, right_index);
+
+                    // Continue with left block
+                    current_index = left_index;
+                    current_rank--;
+                }
+
+                // Now we have a block of requested rank
+                // Mark pages as allocated
+                int start_page = current_index * (1 << (rank - 1));
+                int num_pages = 1 << (rank - 1);
+                mark_pages(start_page, num_pages, 1);
+
+                return block_index_to_addr(current_index, rank);
+            }
+        }
+    }
+
+    return ERR_PTR(-ENOSPC);
 }
 
 int return_pages(void *p) {
@@ -251,7 +203,7 @@ int return_pages(void *p) {
         return -EINVAL;
     }
 
-    // Check if p is within memory range
+    // Check if p is within range
     char *char_p = (char *)p;
     char *char_base = (char *)memory_base;
     char *char_end = char_base + total_pages * PAGE_SIZE;
@@ -266,22 +218,69 @@ int return_pages(void *p) {
         return -EINVAL;
     }
 
-    // Find the rank of this block
-    int rank = get_block_rank(p);
-    if (rank == 0) {
-        return -EINVAL;
+    // Find the rank of allocated block
+    // Try all ranks from 1 to max_rank
+    for (int rank = 1; rank <= max_rank; rank++) {
+        int block_size = PAGE_SIZE * (1 << (rank - 1));
+        if (offset % block_size == 0) {
+            int index = offset / block_size;
+            int max_blocks = total_pages / (1 << (rank - 1));
+            if (index < max_blocks) {
+                // Check if this block is allocated
+                int start_page = index * (1 << (rank - 1));
+                int num_pages = 1 << (rank - 1);
+
+                if (check_pages_allocated(start_page, num_pages)) {
+                    // Free it
+                    mark_pages(start_page, num_pages, 0);
+
+                    // Add to free list and merge with buddy
+                    int current_index = index;
+                    int current_rank = rank;
+
+                    while (current_rank < max_rank) {
+                        // Try to merge with buddy
+                        int buddy_index = get_buddy_index(current_index, current_rank);
+
+                        // Check if buddy is free
+                        int buddy_free = 0;
+                        Block *prev = NULL;
+                        Block *curr = free_lists[current_rank];
+                        while (curr) {
+                            if (curr->index == buddy_index) {
+                                // Remove buddy from free list
+                                if (prev) {
+                                    prev->next = curr->next;
+                                } else {
+                                    free_lists[current_rank] = curr->next;
+                                }
+                                free(curr);
+                                buddy_free = 1;
+                                break;
+                            }
+                            prev = curr;
+                            curr = curr->next;
+                        }
+
+                        if (buddy_free) {
+                            // Merge with buddy
+                            current_index = current_index / 2;  // Parent index
+                            current_rank++;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Add merged block to free list
+                    add_free_block(current_rank, current_index);
+
+                    return OK;
+                }
+            }
+        }
     }
 
-    // Check if block is actually allocated
-    // For simplicity, we'll assume it's allocated if address is valid
-    // In a real implementation, we'd track allocated blocks
-
-    // Mark block as free
-    size_t block_size = PAGE_SIZE * (1 << (rank - 1));
-    int block_offset = offset / block_size;
-    mark_block_free(rank, block_offset);
-
-    return OK;
+    return ERR_PTR(-EINVAL);
 }
 
 int query_ranks(void *p) {
@@ -289,7 +288,7 @@ int query_ranks(void *p) {
         return -EINVAL;
     }
 
-    // Check if p is within memory range
+    // Check if p is within range
     char *char_p = (char *)p;
     char *char_base = (char *)memory_base;
     char *char_end = char_base + total_pages * PAGE_SIZE;
@@ -298,48 +297,51 @@ int query_ranks(void *p) {
         return -EINVAL;
     }
 
-    // Find the leaf index for this address
     ptrdiff_t offset = char_p - char_base;
     if (offset % PAGE_SIZE != 0) {
         return -EINVAL;
     }
 
-    int page_index = offset / PAGE_SIZE;
+    // For allocated pages: return actual rank
+    // For unallocated: return maximum rank containing this page
 
-    // Convert to leaf index in tree
-    int leaf_level = max_rank - 1;
-    int leaves_start = (1 << leaf_level) - 1;
-    int leaf_index = leaves_start + page_index;
+    // Check all ranks from max_rank down to 1
+    for (int rank = max_rank; rank >= 1; rank--) {
+        int block_size = PAGE_SIZE * (1 << (rank - 1));
+        if (offset % block_size == 0) {
+            int index = offset / block_size;
+            int max_blocks = total_pages / (1 << (rank - 1));
+            if (index < max_blocks) {
+                // Check if any page in this block is allocated
+                int start_page = index * (1 << (rank - 1));
+                int num_pages = 1 << (rank - 1);
 
-    if (leaf_index >= tree_size) {
-        return -EINVAL;
-    }
-
-    // Check if this leaf is allocated (tree[leaf_index] == 0)
-    // If allocated, return rank 1
-    if (tree[leaf_index] == 0) {
-        return 1;
-    }
-
-    // For unallocated: find the largest free block containing this leaf
-    // Traverse up the tree
-    int index = leaf_index;
-    int rank = 1;  // Start with rank 1 (leaf)
-
-    while (index > 0) {
-        int parent = (index - 1) / 2;
-
-        // Check if parent represents a free block
-        if (tree[parent] > 0) {
-            // Parent is a free block
-            rank++;
-            index = parent;
-        } else {
-            break;
+                if (check_pages_allocated(start_page, num_pages)) {
+                    // Some page in block is allocated
+                    // Need to find which rank exactly
+                    // For simplicity, if any page allocated, return 1
+                    // Actually need to check smaller blocks
+                    for (int r = 1; r <= rank; r++) {
+                        int sub_block_size = PAGE_SIZE * (1 << (r - 1));
+                        if (offset % sub_block_size == 0) {
+                            int sub_index = offset / sub_block_size;
+                            int sub_start = sub_index * (1 << (r - 1));
+                            int sub_num = 1 << (r - 1);
+                            if (check_pages_allocated(sub_start, sub_num)) {
+                                return r;
+                            }
+                        }
+                    }
+                    return 1;
+                } else {
+                    // Entire block is free
+                    return rank;
+                }
+            }
         }
     }
 
-    return rank;
+    return -EINVAL;
 }
 
 int query_page_counts(int rank) {
@@ -351,17 +353,12 @@ int query_page_counts(int rank) {
         return 0;
     }
 
-    // Count free blocks of given rank
-    // Traverse tree at level corresponding to rank
-    int level = max_rank - rank;
-    int start_index = (1 << level) - 1;
-    int nodes_at_level = 1 << level;
+    // Count blocks in free list
     int count = 0;
-
-    for (int i = 0; i < nodes_at_level && start_index + i < tree_size; i++) {
-        if (tree[start_index + i] >= rank) {
-            count++;
-        }
+    Block *curr = free_lists[rank];
+    while (curr) {
+        count++;
+        curr = curr->next;
     }
 
     return count;
