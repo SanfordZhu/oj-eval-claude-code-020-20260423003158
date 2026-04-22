@@ -246,9 +246,9 @@ void *alloc_pages(int rank) {
     return addr;
 }
 
-int return_pages(void *p) {
+void *return_pages(void *p) {
     if (!p || !memory_base) {
-        return -EINVAL;
+        return ERR_PTR(-EINVAL);
     }
 
     // Check if p is within memory range
@@ -257,19 +257,19 @@ int return_pages(void *p) {
     char *char_end = char_base + total_pages * PAGE_SIZE;
 
     if (char_p < char_base || char_p >= char_end) {
-        return -EINVAL;
+        return ERR_PTR(-EINVAL);
     }
 
     // Check alignment
     ptrdiff_t offset = char_p - char_base;
     if (offset % PAGE_SIZE != 0) {
-        return -EINVAL;
+        return ERR_PTR(-EINVAL);
     }
 
     // Find the rank of this block
     int rank = get_block_rank(p);
     if (rank == 0) {
-        return -EINVAL;
+        return ERR_PTR(-EINVAL);
     }
 
     // Check if block is actually allocated
@@ -281,7 +281,7 @@ int return_pages(void *p) {
     int block_offset = offset / block_size;
     mark_block_free(rank, block_offset);
 
-    return OK;
+    return (void *)OK;
 }
 
 int query_ranks(void *p) {
