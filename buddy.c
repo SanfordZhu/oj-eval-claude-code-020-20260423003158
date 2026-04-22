@@ -143,7 +143,7 @@ int init_page(void *p, int pgcount) {
 
 void *alloc_pages(int rank) {
     if (rank < 1 || rank > MAX_RANK) {
-        return -EINVAL;
+        return ERR_PTR(-EINVAL);
     }
 
     if (!memory_base || rank > max_rank) {
@@ -280,7 +280,7 @@ int return_pages(void *p) {
         }
     }
 
-    return ERR_PTR(-EINVAL);
+    return -EINVAL;
 }
 
 int query_ranks(void *p) {
